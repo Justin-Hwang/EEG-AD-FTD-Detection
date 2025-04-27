@@ -1,0 +1,28 @@
+# Ignore data files (e.g., large dataset files)
+*.set
+*.json
+*.tsv
+*.png
+
+# Ignore specific directories
+derivatives/
+data-imgs/
+intermediate-data/
+model-data/
+intermediate_output_vis/
+eegformer_models/
+eegformer_imgs/
+wandb/
+
+# Ignore Python bytecode files
+*.pyc
+
+# Ignore virtual environment folder
+.venv/
+
+# Ignore log files
+*.log
+
+# Ignore Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+venv/
