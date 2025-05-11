@@ -5,45 +5,53 @@ import torch.nn as nn
 
 # === Depthwise Temporal Convolution ===
 class ODCM(nn.Module):
-    def __init__(self, in_channels, kernel_size, num_filters):
+    def __init__(self, in_channels, kernel_size, num_filters, odcm_dropout_rate):
         super().__init__()
         S = in_channels
-        C = num_filters # 120
-        self.conv1 = nn.Conv1d(in_channels=S, out_channels=S*C, kernel_size=kernel_size, padding=0, groups=S) # kernel_size = 10
-        self.conv2 = nn.Conv1d(in_channels=S*C, out_channels=S*C, kernel_size=kernel_size, padding=0, groups=S*C)
-        self.conv3 = nn.Conv1d(in_channels=S*C, out_channels=S*C, kernel_size=kernel_size, padding=0, groups=S*C)
+        C = num_filters # 120 -> 90
+        self.conv1 = nn.Conv1d(in_channels=S, out_channels=S*C, kernel_size=kernel_size, padding=0, groups=S, bias=False) # kernel_size = 10
+        self.bn1 = nn.BatchNorm1d(S*C)
+        
+        self.conv2 = nn.Conv1d(in_channels=S*C, out_channels=S*C, kernel_size=kernel_size, padding=0, groups=S*C, bias=False)
+        self.bn2 = nn.BatchNorm1d(S*C)
+        
         self.relu = nn.ReLU()
-        self.dropout = nn.Dropout(p=0.2)
+        self.dropout = nn.Dropout(odcm_dropout_rate)
 
     def forward(self, x):  # x = [B = Batch, S = Channels, L = Time] , C = Filters
         B,S,L = x.shape
-        z1 = self.relu(self.conv1(x)) # z1 = [B, S*C, L1]
-        z1 = self.dropout(z1)
-        z2 = self.relu(self.conv2(z1)) # z2 = [B, S*C*C, L2]
-        z2 = self.dropout(z2)
-        z3buf = self.relu(self.conv3(z2)) # z3 [B, S*C*C*C, L3]
+        # 1st conv block
+        z1 = self.conv1(x)
+        z1 = self.bn1(z1)
+        z1 = self.relu(z1)
+        z1 = self.dropout(z1) # z1 = [B, S*C, L1]
+        
+        z2 = self.conv2(z1)
+        z2 = self.bn2(z2)
+        z2 = self.relu(z2)
+        z2 = self.dropout(z2) # z2 = [B, S*C*C, L2]
         
         # 4D reshape
-        _,SC,L3 = z3buf.shape
+        _,SC,L3 = z2.shape
         C = SC//S
-        z3 = z3buf.view(B,S,C,L3)
+        z3 = z2.view(B,S,C,L3)
 
         return z3 # [B, S, C, L3]
 
 class TransformerBlock(nn.Module):
-    def __init__(self, dim, heads, dropout):
+    def __init__(self, dim, heads, encoder_dropout_rate):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
-        self.attn  = nn.MultiheadAttention(embed_dim=dim, num_heads=heads, dropout=dropout, batch_first=True)
+        self.attn  = nn.MultiheadAttention(embed_dim=dim, num_heads=heads, dropout=encoder_dropout_rate, batch_first=True)
         self.norm2 = nn.LayerNorm(dim)
-        self.attn_dropout = nn.Dropout(dropout)
+        self.attn_dropout = nn.Dropout(encoder_dropout_rate)
         # Feedforward MLP (dim->4*dim->dim)
         self.mlp   = nn.Sequential(
             nn.Linear(dim, dim * 4),
             nn.GELU(),
-            nn.Dropout(dropout),
+            nn.Dropout(encoder_dropout_rate),
             nn.Linear(dim * 4, dim),
-            nn.Dropout(dropout),
+            nn.Dropout(encoder_dropout_rate),
         )
 
     def forward(self, x):
@@ -71,12 +79,13 @@ class RTM(nn.Module):
                  seq_len:int,       # = L_e (ODCM output time length)
                  embed_dim:int,     # Embedding Dimension D (D==C)
                  num_heads:int,
-                 num_blocks:int):
+                 num_blocks:int,
+                 encoder_dropout_rate:float):
         super().__init__()
         S, C, L, D = num_regions, num_filters, seq_len, embed_dim
         self.S, self.C, self.L = S, C, L
         
-        self.token_dropout = nn.Dropout(p=0.2)
+        self.token_dropout = nn.Dropout(encoder_dropout_rate)
 
         # 1) linear patch embedding: R^{L_e} → R^{D}
         self.token_embed = nn.Linear(L, D)
@@ -88,7 +97,7 @@ class RTM(nn.Module):
         self.pos_embed   = nn.Parameter(torch.randn(1, 1 + S*C, D))
 
         # 4) Transformer Blocks
-        self.blocks = nn.Sequential(*[TransformerBlock(D, num_heads, dropout=0.2) for _ in range(num_blocks)])
+        self.blocks = nn.Sequential(*[TransformerBlock(D, num_heads, encoder_dropout_rate) for _ in range(num_blocks)])
 
     def forward(self, x):
         """
@@ -137,18 +146,19 @@ class STM(nn.Module):
                  num_filters: int,   # C (# of depthwise Filter)
                  embed_dim: int,     # D (Embedding Dimension, same as num_filters)
                  num_heads: int,
-                 num_blocks: int):
+                 num_blocks: int,
+                 encoder_dropout_rate: float):
         super().__init__()
         S, C, D = num_regions, num_filters, embed_dim
         self.S, self.C, self.D = S, C, D
         
-        self.token_dropout = nn.Dropout(0.2)
+        self.token_dropout = nn.Dropout(encoder_dropout_rate)
 
         # For each token, linear patch embedding D->D mapping
         self.token_embed = nn.Linear(D, D)
         self.cls_token   = nn.Parameter(torch.randn(1, 1, D))
         self.pos_embed   = nn.Parameter(torch.randn(1, 1 + S*C, D))
-        self.blocks = nn.Sequential(*[TransformerBlock(dim=D, heads=num_heads, dropout=0.2) for _ in range(num_blocks)])
+        self.blocks = nn.Sequential(*[TransformerBlock(D, num_heads, encoder_dropout_rate) for _ in range(num_blocks)])
 
     def forward(self, x):
         """
@@ -194,14 +204,14 @@ class TTM(nn.Module):
                  embed_dim: int,   # D, Embedding Dimension (After RTM, STM)
                  num_heads: int,
                  num_blocks: int,
-                 dropout: float = 0.2):
+                 encoder_dropout_rate: float):
         super().__init__()
         self.M = num_segments
         self.S = num_regions
         self.C = num_filters
         self.D = embed_dim
         
-        self.token_dropout = nn.Dropout(dropout)
+        self.token_dropout = nn.Dropout(encoder_dropout_rate)
 
         # 1) Token Embedding: R^{S*C} → R^{D}
         self.token_embed = nn.Linear(self.S * self.C, self.D)
@@ -213,7 +223,7 @@ class TTM(nn.Module):
         self.pos_embed = nn.Parameter(torch.randn(1, 1 + self.M, self.D))
 
         # 4) Transformer blocks
-        self.blocks = nn.Sequential(*[TransformerBlock(dim=self.D, heads=num_heads, dropout=dropout) for _ in range(num_blocks)])
+        self.blocks = nn.Sequential(*[TransformerBlock(self.D, num_heads, encoder_dropout_rate) for _ in range(num_blocks)])
         # 5) LayerNorm
         self.ln = nn.LayerNorm(self.D)
         self.out_proj = nn.Linear(self.D, self.S * self.C)
@@ -270,6 +280,8 @@ class CNNDecoder(nn.Module):
         num_regions: int,    # S: number of channels
         num_filters: int,    # C: number of depthwise filters
         num_segments: int,   # M: number of temporal segments after TTM
+        decoder_dropout_rate: float, # Decoder Dropout Rate
+        last_dropout_rate: float, # Last Layer Dropout Rate
         num_classes: int     # number of output classes
     ):
         super().__init__()
@@ -279,26 +291,29 @@ class CNNDecoder(nn.Module):
 
         # 1) channel-fusion: C → 1 via 1×1 Conv2d
         #    input: [B, C, S, M] → [B, 1, S, M]
-        self.conv1 = nn.Conv2d(in_channels=self.num_filters, out_channels=1, kernel_size=(1, 1), bias=True)
-        self.conv1_dropout = nn.Dropout2d(p=0.2)
+        self.conv1 = nn.Conv2d(in_channels=self.num_filters, out_channels=1, kernel_size=(1, 1), bias=False)
+        self.bn1 = nn.BatchNorm2d(1)
+        self.conv1_dropout = nn.Dropout2d(decoder_dropout_rate)
 
         # 2) spatial-fusion: S → N
         #    input: [B, 1, S, M] → [B, N, 1, M]
-        N = 16
-        self.conv2 = nn.Conv2d(in_channels=1,out_channels=N,kernel_size=(self.num_regions, 1),bias=True)
-        self.conv2_dropout = nn.Dropout2d(p=0.2)
+        N = 8
+        self.conv2 = nn.Conv2d(in_channels=1,out_channels=N,kernel_size=(self.num_regions, 1),bias=False)
+        self.bn2 = nn.BatchNorm2d(N)
+        self.conv2_dropout = nn.Dropout2d(decoder_dropout_rate)
 
         # 3) temporal down-sample: M → M//2
         #    input: [B, N, 1, M] → [B, N2, 1, M//2]
-        N2 = 32
-        self.conv3 = nn.Conv2d(in_channels=N,out_channels=N2,kernel_size=(1, 2),stride=(1, 2),bias=True)
-        self.conv3_dropout = nn.Dropout2d(p=0.2)
+        N2 = 16
+        self.conv3 = nn.Conv2d(in_channels=N,out_channels=N2,kernel_size=(1, 2),stride=(1, 2),bias=False)
+        self.bn3 = nn.BatchNorm2d(N2)
+        self.conv3_dropout = nn.Dropout2d(decoder_dropout_rate)
 
         # 4) final classifier
         #    flattened features: N2 * (M//2)
         self.fc   = nn.Linear(N2 * (self.num_segments // 2), num_classes)
         self.relu = nn.ReLU()
-        self.dropout = nn.Dropout(p=0.5)
+        self.dropout = nn.Dropout(last_dropout_rate)
 
     def forward(self, O: torch.Tensor):
         """
@@ -317,15 +332,15 @@ class CNNDecoder(nn.Module):
              .permute(0, 3, 2, 1)  # → [B, C, S, M]
 
         # 1) channel-fusion
-        x = self.relu(self.conv1(x))   # [B, 1, S, M]
+        x = self.relu(self.bn1(self.conv1(x)))   # [B, 1, S, M]
         x = self.conv1_dropout(x)
 
         # 2) spatial-fusion
-        x = self.relu(self.conv2(x))   # [B, N, 1, M]
+        x = self.relu(self.bn2(self.conv2(x)))   # [B, N, 1, M]
         x = self.conv2_dropout(x)
         
         # 3) temporal down-sample
-        x = self.relu(self.conv3(x))   # [B, N2, 1, M//2]
+        x = self.relu(self.bn3(self.conv3(x)))   # [B, N2, 1, M//2]
         x = self.conv3_dropout(x)
         
         # 4) flatten and classify
@@ -346,6 +361,10 @@ class EEGformer(nn.Module):
                  num_heads: int,
                  num_blocks: int,
                  num_segments: int,  # M
+                 odcm_dropout_rate: float,
+                 encoder_dropout_rate: float,
+                 decoder_dropout_rate: float,
+                 last_dropout_rate: float,
                  num_classes: int):
         super().__init__()
         self.in_channels  = in_channels
@@ -354,28 +373,29 @@ class EEGformer(nn.Module):
         self.input_length = input_length
 
         # 1) Depthwise Temporal Conv Module
-        self.odcm = ODCM(in_channels=in_channels,kernel_size=kernel_size,num_filters=num_filters)
+        self.odcm = ODCM(in_channels, kernel_size, num_filters, odcm_dropout_rate)
 
-        # 2)seq_len ->  L_e = L - 3*(kernel_size-1)
-        seq_len   = input_length - 3 * (kernel_size - 1)
+        # 2)seq_len ->  L_e = L - 2*(kernel_size-1)
+        # Decreased Convolutional Layers in ODCM from 3 layers to 2 layers
+        seq_len   = input_length - 2 * (kernel_size - 1)
         # D = num_filters
         embed_dim = num_filters
 
         # 3) Regional Transformer
         self.rtm = RTM(num_regions=in_channels,num_filters=num_filters,seq_len=seq_len,
-                       embed_dim=embed_dim,num_heads=num_heads,num_blocks=num_blocks)
+                       embed_dim=embed_dim,num_heads=num_heads,num_blocks=num_blocks, encoder_dropout_rate=encoder_dropout_rate)
 
         # 4) Synchronous Transformer
         self.stm = STM(num_regions=in_channels,num_filters=num_filters,embed_dim=embed_dim,
-                       num_heads=num_heads,num_blocks=num_blocks)
+                       num_heads=num_heads,num_blocks=num_blocks, encoder_dropout_rate=encoder_dropout_rate)
 
         # 5) Temporal Transformer
         self.ttm = TTM(num_segments=num_segments,num_regions=in_channels,num_filters=num_filters,
-                       embed_dim=embed_dim,num_heads=num_heads,num_blocks=num_blocks)
+                       embed_dim=embed_dim,num_heads=num_heads,num_blocks=num_blocks,encoder_dropout_rate=encoder_dropout_rate)
 
         # 6) CNN Decoder
-        self.decoder = CNNDecoder(num_regions=in_channels,num_filters=num_filters,
-                                  num_segments=num_segments,num_classes=num_classes)
+        self.decoder = CNNDecoder(num_regions=in_channels,num_filters=num_filters,num_segments = num_segments,
+                                  decoder_dropout_rate=decoder_dropout_rate,last_dropout_rate=last_dropout_rate, num_classes=num_classes)
 
     def forward(self, x):
         """
